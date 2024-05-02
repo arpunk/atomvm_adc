@@ -1,7 +1,8 @@
 #
-# This file is part of AtomVM.
+# This file is not part of AtomVM.
 #
 # Copyright 2022 Fred Dushin <fred@dushin.net>
+# Copyright 2024 Ricardo Lanziano <arpunk@fatelectron.net>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +26,10 @@ set(ATOMVM_ADC_COMPONENT_SRCS
 idf_component_register(
     SRCS ${ATOMVM_ADC_COMPONENT_SRCS}
     INCLUDE_DIRS "nifs/include"
-    PRIV_REQUIRES "libatomvm" "avm_sys" "esp_adc_cal"
+    PRIV_REQUIRES "libatomvm" "avm_sys" "esp_adc"
 )
 
 idf_build_set_property(
-    LINK_OPTIONS "-Wl,--whole-archive ${CMAKE_CURRENT_BINARY_DIR}/lib${COMPONENT_NAME}.a -Wl,--no-whole-archive"
+    LINK_OPTIONS "-Wl,--whole-archive;${CMAKE_CURRENT_BINARY_DIR}/lib${COMPONENT_NAME}.a;-Wl,--no-whole-archive"
     APPEND
 )

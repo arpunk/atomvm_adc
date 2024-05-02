@@ -1,5 +1,6 @@
 %%
 %% Copyright (c) 2020 dushin.net
+%% Copyright (c) 2024 Ricardo Lanziano <arpunk@fatelectron.net>
 %% All rights reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +18,7 @@
 %%-----------------------------------------------------------------------------
 %% @doc ADC support.
 %%
-%% Use this module to take ADC readings on an ESP32 device. ADC1 is enabled by 
+%% Use this module to take ADC readings on an ESP32 device. ADC1 is enabled by
 %% default and allows taking reading from pins 32-39. If ADC2 is also enabled
 %% pins 0, 2, 4, 12-15, and 25-27 may be used as long as WiFi is not required
 %% by the application. A solution should be available soon to allow for
@@ -26,8 +27,10 @@
 %%-----------------------------------------------------------------------------
 -module(adc).
 
+-export([open/1, open_nif/1, take_reading/2, take_reading_nif/2]).
+
 -export([
-    start/1, start/2, stop/1, read/1, read/2
+    start_link/1, start/1, start/2, stop/1, read/1, read/2
 ]).
 -export([config_width/2, config_channel_attenuation/2, take_reading/4, pin_is_adc2/1]). %% internal nif APIs
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
@@ -95,6 +98,24 @@ start(Pin) ->
 -spec start(Pin::adc_pin(), Options::options()) -> {ok, adc()} | {error, Reason::term()}.
 start(Pin, Options) ->
     gen_server:start(?MODULE, [Pin, Options], []).
+
+open_nif(_Params) ->
+    erlang:nif_error(undefined).
+
+take_reading(ADC, Options) ->
+    ?MODULE:take_reading_nif(ADC, Options).
+
+take_reading_nif(_ADC, _Opts) ->
+    erlang:nif_error(undefined).
+
+open(Params) ->
+    ?MODULE:open_nif(Params).
+
+start_link(Pin) ->
+    start_link(Pin, ?DEFAULT_OPTIONS).
+
+start_link(Pin, Options) ->
+    gen_server:start_link(?MODULE, [Pin, Options], []).
 
 %%-----------------------------------------------------------------------------
 %% @returns ok

@@ -23,16 +23,19 @@
 
 #include <context.h>
 #include <defaultatoms.h>
+#include <erl_nif_priv.h>
+#include <globalcontext.h>
 #include <interop.h>
+#include <module.h>
 #include <nifs.h>
 #include <term.h>
 
 // #define ENABLE_TRACE
 #include <trace.h>
 
-#include <driver/adc.h>
+#include <esp_adc/adc_oneshot.h>
 #include <esp32_sys.h>
-#include <esp_adc_cal.h>
+#include <esp_adc/adc_cali.h>
 #include <esp_log.h>
 #include <sdkconfig.h>
 
@@ -42,19 +45,62 @@
 #define DEFAULT_SAMPLES 64
 #define DEFAULT_VREF 1100
 
+static ErlNifResourceType *adc_resource_type;
+
+struct ADCResource
+{
+    term transmitting_pid;
+    adc_channel_t channel;
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_cali_handle_t adc1_cali_chan0_handle;
+    bool cal_1_chan_0;
+    adc_cali_handle_t adc2_cali_handler;
+    adc_oneshot_unit_handle_t adc2_handle;
+    bool cal_2;
+};
+
+#ifdef CONFIG_AVM_ADC2_ENABLE
+static const char *const timeout_atom = ATOM_STR("\x7", "timeout");
+#endif
+
+//ADC1 Channels
+#if CONFIG_IDF_TARGET_ESP32
+#define ATOMVM_ADC1_CHAN0          ADC_CHANNEL_4
+#define ATOMVM_ADC1_CHAN1          ADC_CHANNEL_5
+#else
+#define ATOMVM_ADC1_CHAN0          ADC_CHANNEL_0
+#define ATOMVM_ADC1_CHAN1          ADC_CHANNEL_1
+#endif
+
+#if (SOC_ADC_PERIPH_NUM >= 2) && !CONFIG_IDF_TARGET_ESP32C3
+/**
+ * On ESP32C3, ADC2 is no longer supported, due to its HW limitation.
+ * Search for errata on espressif website for more details.
+ */
+#define ATOMVM_ADC_USE_ADC2            1
+#endif
+
+#if ATOMVM_USE_ADC2
+//ADC2 Channels
+#if CONFIG_IDF_TARGET_ESP32
+#define ATOMVM_ADC2_CHAN0          ADC_CHANNEL_0
+#else
+#define ATOMVM_ADC2_CHAN0          ADC_CHANNEL_0
+#endif
+#endif  //#if ATOMVM_USE_ADC2
 
 static const AtomStringIntPair bit_width_table[] = {
-    { ATOM_STR("\x7", "bit_max"), (ADC_WIDTH_BIT_DEFAULT) },
+    { ATOM_STR("\x7", "bit_max"), (ADC_BITWIDTH_DEFAULT) },
 #if SOC_ADC_MAX_BITWIDTH == 13
-    { ATOM_STR("\x6", "bit_13"), ADC_WIDTH_BIT_13 },
+    { ATOM_STR("\x6", "bit_13"), ADC_BITWIDTH_13 },
 #elif SOC_ADC_MAX_BITWIDTH == 12
-    { ATOM_STR("\x6", "bit_12"), ADC_WIDTH_BIT_12 },
+    { ATOM_STR("\x6", "bit_12"), ADC_BITWIDTH_12 },
 #elif CONFIG_IDF_TARGET_ESP32
-    { ATOM_STR("\x6", "bit_11"), ADC_WIDTH_BIT_11 },
-    { ATOM_STR("\x6", "bit_10"), ADC_WIDTH_BIT_10 },
-    { ATOM_STR("\x5", "bit_9"), ADC_WIDTH_BIT_9 },
+    { ATOM_STR("\x6", "bit_11"), ADC_BITWIDTH_11 },
+    { ATOM_STR("\x6", "bit_10"), ADC_BITWIDTH_10 },
+    { ATOM_STR("\x5", "bit_9"), ADC_BITWIDTH_9 },
 #endif
-    SELECT_INT_DEFAULT(ADC_WIDTH_MAX)
+    SELECT_INT_DEFAULT(ADC_BITWIDTH_DEFAULT)
 };
 
 static const AtomStringIntPair attenuation_table[] = {
@@ -62,15 +108,9 @@ static const AtomStringIntPair attenuation_table[] = {
     { ATOM_STR("\x6", "db_2_5"), ADC_ATTEN_DB_2_5 },
     { ATOM_STR("\x4", "db_6"), ADC_ATTEN_DB_6 },
     { ATOM_STR("\x5", "db_11"), ADC_ATTEN_DB_11 },
-    SELECT_INT_DEFAULT(ADC_ATTEN_MAX)
+    { ATOM_STR("\x5", "db_12"), ADC_ATTEN_DB_12 },
+    SELECT_INT_DEFAULT(ADC_ATTEN_DB_12)
 };
-
-static const char *const invalid_pin_atom   = ATOM_STR("\xb", "invalid_pin");
-static const char *const invalid_width_atom = ATOM_STR("\xd", "invalid_width");
-static const char *const invalid_db_atom    = ATOM_STR("\xa", "invalid_db");
-#ifdef CONFIG_AVM_ADC2_ENABLE
-static const char *const timeout_atom = ATOM_STR("\x7", "timeout");
-#endif
 
 static adc_unit_t adc_unit_from_pin(int pin_val)
 {
@@ -132,7 +172,7 @@ static adc_unit_t adc_unit_from_pin(int pin_val)
             return ADC_UNIT_2;
 #endif
         default:
-            return ADC_UNIT_MAX;
+            return SOC_ADC_PERIPH_NUM;
     }
 }
 
@@ -141,377 +181,384 @@ static adc_channel_t get_channel(avm_int_t pin_val)
     switch (pin_val) {
 #if CONFIG_IDF_TARGET_ESP32
         case 32:
-            return ADC1_CHANNEL_4;
+            return ADC_CHANNEL_4;
         case 33:
-            return ADC1_CHANNEL_5;
+            return ADC_CHANNEL_5;
         case 34:
-            return ADC1_CHANNEL_6;
+            return ADC_CHANNEL_6;
         case 35:
-            return ADC1_CHANNEL_7;
+            return ADC_CHANNEL_7;
         case 36:
-            return ADC1_CHANNEL_0;
+            return ADC_CHANNEL_0;
         case 37:
-            return ADC1_CHANNEL_1;
+            return ADC_CHANNEL_1;
         case 38:
-            return ADC1_CHANNEL_2;
+            return ADC_CHANNEL_2;
         case 39:
-            return ADC1_CHANNEL_3;
+            return ADC_CHANNEL_3;
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
         case 1:
-            return ADC1_CHANNEL_0;
+            return ADC_CHANNEL_0;
         case 2:
-            return ADC1_CHANNEL_1;
+            return ADC_CHANNEL_1;
         case 3:
-            return ADC1_CHANNEL_2;
+            return ADC_CHANNEL_2;
         case 4:
-            return ADC1_CHANNEL_3;
+            return ADC_CHANNEL_3;
         case 5:
-            return ADC1_CHANNEL_4;
+            return ADC_CHANNEL_4;
         case 6:
-            return ADC1_CHANNEL_5;
+            return ADC_CHANNEL_5;
         case 7:
-            return ADC1_CHANNEL_6;
+            return ADC_CHANNEL_6;
         case 8:
-            return ADC1_CHANNEL_7;
+            return ADC_CHANNEL_7;
         case 9:
-            return ADC1_CHANNEL_8;
+            return ADC_CHANNEL_8;
         case 10:
-            return ADC1_CHANNEL_9;
+            return ADC_CHANNEL_9;
 #elif CONFIG_IDF_TARGET_ESP32C3
         case 0:
-            return ADC1_CHANNEL_0;
+            return ADC_CHANNEL_0;
         case 1:
-            return ADC1_CHANNEL_1;
+            return ADC_CHANNEL_1;
         case 2:
-            return ADC1_CHANNEL_2;
+            return ADC_CHANNEL_2;
         case 3:
-            return ADC1_CHANNEL_3;
+            return ADC_CHANNEL_3;
         case 4:
-            return ADC1_CHANNEL_4;
+            return ADC_CHANNEL_4;
 #endif
 #ifdef CONFIG_AVM_ADC2_ENABLE
 #if CONFIG_IDF_TARGET_ESP32
         case 0:
-            return ADC2_CHANNEL_1;
+            return ADC_CHANNEL_1;
         case 2:
-            return ADC2_CHANNEL_2;
+            return ADC_CHANNEL_2;
         case 4:
-            return ADC2_CHANNEL_0;
+            return ADC_CHANNEL_0;
         case 12:
-            return ADC2_CHANNEL_5;
+            return ADC_CHANNEL_5;
         case 13:
-            return ADC2_CHANNEL_4;
+            return ADC_CHANNEL_4;
         case 14:
-            return ADC2_CHANNEL_6;
+            return ADC_CHANNEL_6;
         case 15:
-            return ADC2_CHANNEL_3;
+            return ADC_CHANNEL_3;
         case 25:
-            return ADC2_CHANNEL_8;
+            return ADC_CHANNEL_8;
         case 26:
-            return ADC2_CHANNEL_9;
+            return ADC_CHANNEL_9;
         case 27:
-            return ADC2_CHANNEL_7;
+            return ADC_CHANNEL_7;
 #elif CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
         case 11:
-            return ADC2_CHANNEL_0;
+            return ADC_CHANNEL_0;
         case 12:
-            return ADC2_CHANNEL_1;
+            return ADC_CHANNEL_1;
         case 13:
-            return ADC2_CHANNEL_2;
+            return ADC_CHANNEL_2;
         case 14:
-            return ADC2_CHANNEL_3;
+            return ADC_CHANNEL_3;
         case 15:
-            return ADC2_CHANNEL_4;
+            return ADC_CHANNEL_4;
         case 16:
-            return ADC2_CHANNEL_5;
+            return ADC_CHANNEL_5;
         case 17:
-            return ADC2_CHANNEL_6;
+            return ADC_CHANNEL_6;
         case 18:
-            return ADC2_CHANNEL_7;
+            return ADC_CHANNEL_7;
         case 19:
-            return ADC2_CHANNEL_8;
+            return ADC_CHANNEL_8;
         case 20:
-            return ADC2_CHANNEL_9;
+            return ADC_CHANNEL_9;
 #elif CONFIG_IDF_TARGET_ESP32C3
         case 5:
-            return ADC2_CHANNEL_0;
+            return ADC_CHANNEL_0;
 #endif
 #endif
         default:
-            return ADC_CHANNEL_MAX;
+            return ADC_CHANNEL_0;
     }
 }
 
-static term create_pair(Context *ctx, term term1, term term2)
+static bool nif_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
 {
-    term ret = term_alloc_tuple(2, &ctx->heap);
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .chan = channel,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+        adc_cali_line_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+    *out_handle = handle;
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Calibration Success");
+    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
+        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
+    } else {
+        ESP_LOGE(TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+
+static void nif_adc_calibration_deinit(adc_cali_handle_t handle)
+{
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Curve Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_curve_fitting(handle));
+
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    ESP_LOGI(TAG, "deregister %s calibration scheme", "Line Fitting");
+    ESP_ERROR_CHECK(adc_cali_delete_scheme_line_fitting(handle));
+#endif
+}
+
+static term create_triple(Context *ctx, term term1, term term2, term term3)
+{
+    term ret = term_alloc_tuple(3, &ctx->heap);
     term_put_tuple_element(ret, 0, term1);
     term_put_tuple_element(ret, 1, term2);
+    term_put_tuple_element(ret, 2, term3);
 
     return ret;
 }
 
-static void log_char_val_type(esp_adc_cal_value_t val_type)
-{
-    if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
-        TRACE("Characterized using Two Point Value\n");
-    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
-        TRACE("Characterized using eFuse Vref\n");
-    } else {
-        TRACE("Characterized using Default Vref\n");
-    }
-}
-
-static term nif_adc_config_width(Context *ctx, int argc, term argv[])
+static term nif_adc_open(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
+    GlobalContext *global = ctx->global;
+    term opts = argv[0];
 
-    term pin = argv[0];
+    term pin = interop_kv_get_value(opts, ATOM_STR("\x3", "pin"), global);
+    term width = interop_kv_get_value(opts, ATOM_STR("\x8", "bitwidth"), global);
+    term attenuation = interop_kv_get_value(opts, ATOM_STR("\x5", "atten"), global);
+
     VALIDATE_VALUE(pin, term_is_integer);
-    adc_unit_t adc_unit = adc_unit_from_pin(term_to_int(pin));
-    if (UNLIKELY(adc_unit == ADC_UNIT_MAX)) {
-#ifdef ENABLE_TRACE
-        int Pin = term_to_int(pin);
-#endif
-        TRACE("Pin %i is not a valid adc pin.\n", Pin);
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_pin_atom));
-        }
-    }
-
-    term width = argv[1];
-    VALIDATE_VALUE(width, term_is_atom);
-    adc_bits_width_t bit_width = interop_atom_term_select_int(bit_width_table, width, ctx->global);
-    if (UNLIKELY(bit_width == ADC_WIDTH_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_width_atom));
-        }
-    }
-
-    if (adc_unit == ADC_UNIT_1) {
-        esp_err_t err = adc1_config_width(bit_width);
-        if (err != ESP_OK) {
-            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-            } else {
-                return create_pair(ctx, ERROR_ATOM, term_from_int(err));
-            }
-        }
-        TRACE("Width set to %u\n", bit_width);
-    }
-#ifdef CONFIG_AVM_ADC2_ENABLE
-    else {
-        TRACE("ADC2 read option bit_width set to %u\n", bit_width);
-    }
-#endif
-
-    return OK_ATOM;
-}
-
-static term nif_adc_config_channel_attenuation(Context *ctx, int argc, term argv[])
-{
-    UNUSED(argc);
-
-    term pin = argv[0];
-    VALIDATE_VALUE(pin, term_is_integer);
-    adc_channel_t channel = get_channel(term_to_int(pin));
-    if (UNLIKELY(channel == ADC_CHANNEL_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_pin_atom));
-        }
-    }
-
-    term attenuation = argv[1];
     VALIDATE_VALUE(attenuation, term_is_atom);
-    adc_atten_t atten = interop_atom_term_select_int(attenuation_table, attenuation, ctx->global);
-    if (UNLIKELY(atten == ADC_ATTEN_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_db_atom));
-        }
+    VALIDATE_VALUE(width, term_is_atom);
+
+    struct ADCResource *rsrc_obj = enif_alloc_resource(adc_resource_type, sizeof(struct ADCResource));
+    if (IS_NULL_PTR(rsrc_obj)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
+        RAISE_ERROR(OUT_OF_MEMORY_ATOM);
     }
 
-    adc_unit_t adc_unit = adc_unit_from_pin(term_to_int(pin));
+    adc_channel_t channel = get_channel(pin);
+    adc_bitwidth_t bit_width = interop_atom_term_select_int(bit_width_table, width, global);
+    adc_atten_t atten = interop_atom_term_select_int(attenuation_table, attenuation, global);
 
-    if (adc_unit == ADC_UNIT_1) {
-        esp_err_t err = adc1_config_channel_atten((adc1_channel_t) channel, atten);
-        if (UNLIKELY(err != ESP_OK)) {
-            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-            } else {
-                return create_pair(ctx, ERROR_ATOM, term_from_int(err));
-            }
-        }
-    }
-#ifdef CONFIG_AVM_ADC2_ENABLE
-    else if (adc_unit == ADC_UNIT_2) {
-        esp_err_t err = adc2_config_channel_atten((adc2_channel_t) channel, atten);
-        if (UNLIKELY(err != ESP_OK)) {
-            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-            } else {
-                return create_pair(ctx, ERROR_ATOM, term_from_int(err));
-            }
-        }
-    }
-#endif
+    rsrc_obj->transmitting_pid = term_invalid_term();
+    rsrc_obj->channel = channel;
 
-    TRACE("Attenuation on channel %u set to %u\n", channel, atten);
-    return OK_ATOM;
+    // ADC1 init
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = channel,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    // ADC1 config
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = bit_width,
+        .atten = atten,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, channel, &config));
+
+    // ADC1 calibration init
+    adc_cali_handle_t adc1_cali_chan0_handle = NULL;
+    bool do_cal1_chan0 = nif_adc_calibration_init(ADC_UNIT_1, channel, atten, &adc1_cali_chan0_handle);
+
+    rsrc_obj->adc1_handle = adc1_handle;
+    rsrc_obj->adc1_cali_chan0_handle = adc1_cali_chan0_handle;
+    rsrc_obj->cal_1_chan_0 = do_cal1_chan0;
+
+#if ATOMVM_USE_ADC2
+    // ADC2 init
+    adc_oneshot_unit_handle_t adc2_handle;
+    adc_oneshot_unit_init_cfg_t init_config2 = {
+        .unit_id = channel,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config2, &adc2_handle));
+
+    // ADC2 calibration init
+    adc_cali_handle_t adc2_cali_handle = NULL;
+    bool do_cal2 = nif_adc_calibration_init(ADC_UNIT_2, channel, atten, &adc2_cali_handle);
+
+    // ADC2 config
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, channel, &config));
+
+    rsrc_obj->adc2_cali_handler = adc2_cali_handler;
+    rsrc_obj->adc2_handle = adc2_handle;
+    rsrc_obj->cal_2 = do_cal2;
+#endif  //#if ATOMVM_USE_ADC2
+
+    if (UNLIKELY(memory_ensure_free(ctx, TERM_BOXED_RESOURCE_SIZE) != MEMORY_GC_OK)) {
+        enif_release_resource(rsrc_obj);
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+    }
+
+    term obj = enif_make_resource(erl_nif_env_from_context(ctx), rsrc_obj);
+    enif_release_resource(rsrc_obj);
+
+    // {'$adc', Resource :: resource(), Ref :: reference()} :: adc()
+    size_t requested_size = TUPLE_SIZE(3) + REF_SIZE;
+    if (UNLIKELY(memory_ensure_free_with_roots(ctx, requested_size, 1, &obj, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+    }
+
+    term adc = term_alloc_tuple(3, &ctx->heap);
+    term_put_tuple_element(adc, 0, globalcontext_make_atom(global, ATOM_STR("\x4", "$adc")));
+    term_put_tuple_element(adc, 1, obj);
+    uint64_t ref_ticks = globalcontext_get_ref_ticks(ctx->global);
+    term ref = term_from_ref_ticks(ref_ticks, &ctx->heap);
+    term_put_tuple_element(adc, 2, ref);
+
+    return adc;
+}
+
+static bool is_adc_resource(GlobalContext *global, term t)
+{
+    bool ret = term_is_tuple(t)
+        && term_get_tuple_arity(t) == 3
+        && globalcontext_is_term_equal_to_atom_string(global, term_get_tuple_element(t, 0), ATOM_STR("\x4", "$adc"))
+        && term_is_binary(term_get_tuple_element(t, 1))
+        && term_is_reference(term_get_tuple_element(t, 2));
+
+    return ret;
+}
+
+static bool to_adc_resource(term adc_resource, struct ADCResource **rsrc_obj, Context *ctx)
+{
+    if (!is_adc_resource(ctx->global, adc_resource)) {
+        return false;
+    }
+    void *rsrc_obj_ptr;
+    if (UNLIKELY(!enif_get_resource(erl_nif_env_from_context(ctx),
+				    term_get_tuple_element(adc_resource, 1),
+				    adc_resource_type,
+				    &rsrc_obj_ptr))) {
+        return false;
+    }
+    *rsrc_obj = (struct ADCResource *) rsrc_obj_ptr;
+
+    return true;
 }
 
 static term nif_adc_take_reading(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
 
-    term pin = argv[0];
-    VALIDATE_VALUE(pin, term_is_integer);
-    adc_channel_t channel = get_channel(term_to_int(pin));
-    TRACE("take_reading channel: %u\n", channel);
-    if (UNLIKELY(channel == ADC_CHANNEL_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_pin_atom));
-        }
-    }
+    GlobalContext *global = ctx->global;
+
+    term adc_resource = argv[0];
+    struct ADCResource *rsrc_obj;
 
     term read_options = argv[1];
     VALIDATE_VALUE(read_options, term_is_list);
-    term samples = interop_kv_get_value_default(read_options, ATOM_STR("\x7", "samples"), DEFAULT_SAMPLES, ctx->global);
+    term samples = interop_kv_get_value_default(read_options, ATOM_STR("\x7", "samples"), DEFAULT_SAMPLES, global);
+
     avm_int_t samples_val = term_to_int(samples);
-    TRACE("take_reading samples: %i\n", samples_val);
-    term raw = interop_kv_get_value_default(read_options, ATOM_STR("\x3", "raw"), FALSE_ATOM, ctx->global);
-    term voltage = interop_kv_get_value_default(read_options, ATOM_STR("\x7", "voltage"), FALSE_ATOM, ctx->global);
 
-    term width = argv[2];
-    VALIDATE_VALUE(width, term_is_atom);
-    adc_bits_width_t bit_width = interop_atom_term_select_int(bit_width_table, width, ctx->global);
-    TRACE("take_reading bit width: %i\n", bit_width);
-    if (UNLIKELY(bit_width == ADC_WIDTH_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_width_atom));
-        }
+    if (UNLIKELY(!to_adc_resource(adc_resource, &rsrc_obj, ctx))) {
+        ESP_LOGE(TAG, "Failed to convert adc_resource");
+        RAISE_ERROR(BADARG_ATOM);
     }
 
-    term attenuation = argv[3];
-    VALIDATE_VALUE(attenuation, term_is_atom);
-    adc_atten_t atten = interop_atom_term_select_int(attenuation_table, attenuation, ctx->global);
-    TRACE("take_reading attenuation: %i\n", atten);
-    if (UNLIKELY(atten == ADC_ATTEN_MAX)) {
-        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-            RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-        } else {
-            return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_db_atom));
-        }
+    static uint32_t v = 0, r = 0;
+    static int adc_raw, voltage;
+
+    for (avm_int_t i = 0; i < samples_val; ++i) {
+      ESP_ERROR_CHECK(adc_oneshot_read(rsrc_obj->adc1_handle, rsrc_obj->channel, &adc_raw));
+      if (rsrc_obj->cal_1_chan_0) {
+	ESP_ERROR_CHECK(adc_cali_raw_to_voltage(rsrc_obj->adc1_cali_chan0_handle, adc_raw, &voltage));
+      }
+
+#if ATOMVM_USE_ADC2
+      ESP_ERROR_CHECK(adc_oneshot_read(rsrc_obj->adc2_handle, rsrc_obj->channel, &adc_raw));
+      if (rsrc_obj->cal_2) {
+	ESP_ERROR_CHECK(adc_cali_raw_to_voltage(rsrc_obj->adc2_cali_handle, adc_raw, &voltage));
+      }
+#endif  //#if ATOMVM_USE_ADC2
+
+      v += voltage;
+      r += adc_raw;
     }
 
-    adc_unit_t adc_unit = adc_unit_from_pin(term_to_int(pin));
+    v /= samples_val;
+    r /= samples_val;
 
-    esp_adc_cal_characteristics_t *adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
-    if (UNLIKELY(IS_NULL_PTR(adc_chars))) {
-        RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-    }
-
-    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(adc_unit, atten, bit_width, DEFAULT_VREF, adc_chars);
-    TRACE("take_reading calibration type: %i\n", val_type);
-    log_char_val_type(val_type);
-
-    uint32_t adc_reading = 0;
-    if (adc_unit == ADC_UNIT_1) {
-        // adc1_config_width() is used here in case the last adc1 pin to be configured was of a different width.
-        // this will ensure the calibration characteristics and reading match the desired bit width for the channel.
-        esp_err_t err = adc1_config_width(bit_width);
-        if (UNLIKELY(err != ESP_OK)) {
-            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-                RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-            } else {
-                return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, invalid_width_atom));
-            }
-        }
-        for (avm_int_t i = 0; i < samples_val; ++i) {
-            adc_reading += adc1_get_raw((adc1_channel_t) channel);
-        }
-    }
-#ifdef CONFIG_AVM_ADC2_ENABLE
-    else if (adc_unit == ADC_UNIT_2) {
-        int read_raw;
-        for (avm_int_t i = 0; i < samples_val; ++i) {
-            esp_err_t r = adc2_get_raw((adc2_channel_t) channel, bit_width, &read_raw);
-            if (UNLIKELY(r == ESP_ERR_TIMEOUT)) {
-                ESP_LOGW(TAG, "ADC2 in use by Wi-Fi! Use adc:wifi_release/0 to stop wifi and free adc2 for reading.\n");
-                if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-                    RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-                } else {
-                    return create_pair(ctx, ERROR_ATOM, globalcontext_make_atom(ctx->global, timeout_atom));
-                }
-            }
-            adc_reading += read_raw;
-        }
-    }
-#endif
-    adc_reading /= samples_val;
-    TRACE("take_reading adc_reading: %i\n", adc_reading);
-
-    raw = raw == TRUE_ATOM ? term_from_int32(adc_reading) : UNDEFINED_ATOM;
-    if (voltage == TRUE_ATOM) {
-        voltage = term_from_int32(esp_adc_cal_raw_to_voltage(adc_reading, adc_chars));
-    } else {
-        voltage = UNDEFINED_ATOM;
-    };
-
-    free(adc_chars);
-
-    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
-        RAISE_ERROR(OUT_OF_MEMORY_ATOM);
-    } else {
-        return create_pair(ctx, raw, voltage);
-    }
+    return create_triple(ctx, OK_ATOM, term_from_int32(r), term_from_int32(v));
 }
 
-static term nif_adc_pin_is_adc2(Context *ctx, int argc, term argv[])
+static void nif_adc_resource_dtor(ErlNifEnv *caller_env, void *obj)
 {
-    UNUSED(argc);
-#ifdef CONFIG_AVM_ADC2_ENABLE
-    term pin = argv[0];
-    VALIDATE_VALUE(pin, term_is_integer);
-    adc_unit_t Adc_Unit = adc_unit_from_pin(term_to_int(pin));
-    switch (Adc_Unit) {
-        case ADC_UNIT_2:
-            return TRUE_ATOM;
-        default:
-            return FALSE_ATOM;
+    UNUSED(caller_env);
+    struct ADCResource *rsrc_obj = (struct ADCResource *) obj;
+
+    esp_err_t err = ESP_OK;
+    if (UNLIKELY(err != ESP_OK)) {
+        ESP_LOGW(TAG, "Failed to delete driver in resource d'tor.  err=%i", err);
     }
-#else
-    UNUSED(argv);
-    return FALSE_ATOM;
-#endif
+
+    ESP_ERROR_CHECK(adc_oneshot_del_unit(rsrc_obj->adc1_handle));
+    if (rsrc_obj->cal_1_chan_0) {
+      nif_adc_calibration_deinit(rsrc_obj->adc1_cali_chan0_handle);
+    }
+
+#if ATOMVM_USE_ADC2
+    ESP_ERROR_CHECK(adc_oneshot_del_unit(rsrc_obj->adc2_handle));
+    if (rsrc_obj->cal_2) {
+      nif_adc_calibration_deinit(rsrc_obj->adc2_cali_handle);
+    }
+
+#endif //#if ATOMVM_USE_ADC2
 }
 
-static const struct Nif adc_config_width_nif = {
-    .base.type = NIFFunctionType,
-    .nif_ptr = nif_adc_config_width
+static const ErlNifResourceTypeInit ADCResourceTypeInit = {
+    .members = 1,
+    .dtor = nif_adc_resource_dtor,
 };
-static const struct Nif adc_config_channel_attenuation_nif = {
+
+static const struct Nif adc_open_nif = {
     .base.type = NIFFunctionType,
-    .nif_ptr = nif_adc_config_channel_attenuation
+    .nif_ptr = nif_adc_open
 };
 static const struct Nif adc_take_reading_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_adc_take_reading
-};
-static const struct Nif adc_pin_is_adc2_nif = {
-    .base.type = NIFFunctionType,
-    .nif_ptr = nif_adc_pin_is_adc2
 };
 
 //
@@ -520,44 +567,27 @@ static const struct Nif adc_pin_is_adc2_nif = {
 
 void atomvm_adc_init(GlobalContext *global)
 {
-    // Check TP is burned into eFuse
-    if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK) {
-        ESP_LOGI(TAG, "eFuse Two Point: Supported");
-    } else {
-        ESP_LOGI(TAG, "eFuse Two Point: NOT supported");
-    }
-
-    // Check Vref is burned into eFuse
-    if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_VREF) == ESP_OK) {
-        ESP_LOGI(TAG, "eFuse Vref: Supported");
-    } else {
-        ESP_LOGI(TAG, "eFuse Vref: NOT supported");
-    }
+    ErlNifEnv env;
+    erl_nif_env_partial_init_from_globalcontext(&env, global);
+    adc_resource_type = enif_init_resource_type(&env, "adc_resource", &ADCResourceTypeInit, ERL_NIF_RT_CREATE, NULL);
 }
 
 const struct Nif *atomvm_adc_get_nif(const char *nifname)
 {
     TRACE("Locating nif %s ...", nifname);
-    if (strcmp("adc:config_width/2", nifname) == 0) {
-        TRACE("Resolved platform nif %s ...\n", nifname);
-        return &adc_config_width_nif;
+    if (strcmp("adc:open_nif/1", nifname) == 0) {
+        TRACE("Resolved adc nif %s ...\n", nifname);
+        return &adc_open_nif;
     }
-    if (strcmp("adc:config_channel_attenuation/2", nifname) == 0) {
-        TRACE("Resolved platform nif %s ...\n", nifname);
-        return &adc_config_channel_attenuation_nif;
-    }
-    if (strcmp("adc:take_reading/4", nifname) == 0) {
-        TRACE("Resolved platform nif %s ...\n", nifname);
-        return &adc_take_reading_nif;
-    }
-    if (strcmp("adc:pin_is_adc2/1", nifname) == 0) {
-        TRACE("Resolved platform nif %s ...\n", nifname);
-        return &adc_pin_is_adc2_nif;
+    if (strcmp("adc:take_reading_nif/2", nifname) == 0) {
+        TRACE("Resolved adc nif %s ... \n", nifname);
+	return &adc_take_reading_nif;
     }
     return NULL;
 }
 
 #include <sdkconfig.h>
+
 #ifdef CONFIG_AVM_ADC_ENABLE
 REGISTER_NIF_COLLECTION(atomvm_adc, atomvm_adc_init, NULL, atomvm_adc_get_nif)
 #endif
