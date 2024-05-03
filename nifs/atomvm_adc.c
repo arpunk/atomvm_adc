@@ -292,58 +292,52 @@ static adc_channel_t get_channel(avm_int_t pin_val)
     }
 }
 
+// Wrapper function for line/curve fitting calibration
+static bool do_calibration(adc_unit_t unit,
+			   adc_channel_t channel,
+			   adc_bitwidth_t bit_width,
+			   adc_atten_t atten,
+			   adc_cali_handle_t *handle)
+{
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+  UNUSED(channel);
+
+  adc_cali_curve_fitting_config_t cali_config = {
+    .unit_id = unit,
+    .chan = channel,
+    .atten = atten,
+    .bitwidth = bit_width,
+  };
+  ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+  return adc_cali_create_scheme_curve_fitting(&cali_config, handle) == ESP_OK;
+#endif
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+  adc_cali_line_fitting_config_ cali_config = {
+    .unit_id = unit,
+    .atten = atten,
+    .bitwidth = bit_width,
+  };
+  ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+  return adc_cali_create_scheme_line_fitting(&cali_config, handle) == ESP_OK;
+#endif
+}
+
 static bool nif_adc_calibration_init(adc_unit_t unit,
 				     adc_channel_t channel,
 				     adc_bitwidth_t bit_width,
 				     adc_atten_t atten,
 				     adc_cali_handle_t *out_handle)
 {
-    adc_cali_handle_t handle = NULL;
-    esp_err_t ret = ESP_FAIL;
-    bool calibrated = false;
+  bool calibrated = do_calibration(unit, channel, bit_width, atten, out_handle);
 
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
-        adc_cali_curve_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .chan = channel,
-            .atten = atten,
-            .bitwidth = bit_width,
-        };
-        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
-	if (ret == ESP_OK) {
-	  calibrated = true;
-        }
-    }
-#endif
+  if (calibrated) {
+    ESP_LOGI(TAG, "calibration successful");
+    TRACE("Attenuation on channel %u set to %u, bit width %u\n", channel, atten, bit_width);
+  } else {
+    ESP_LOGW(TAG, "calibration failed or not supported.");
+  }
 
-#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    if (!calibrated) {
-        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
-        adc_cali_line_fitting_config_t cali_config = {
-            .unit_id = unit,
-            .atten = atten,
-            .bitwidth = bit_width,
-        };
-        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
-	if (ret == ESP_OK) {
-	  calibrated = true;
-        }
-    }
-#endif
-
-    *out_handle = handle;
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Calibration Success");
-	TRACE("Attenuation on channel %u set to %u, bit width %u\n", channel, atten, bit_width);
-    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
-        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
-    } else {
-        ESP_LOGE(TAG, "Invalid arg or no memory");
-    }
-
-    return calibrated;
+  return calibrated;
 }
 
 static void nif_adc_calibration_deinit(adc_cali_handle_t handle)
@@ -384,7 +378,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
 
     struct ADCResource *rsrc_obj = enif_alloc_resource(adc_resource_type, sizeof(struct ADCResource));
     if (IS_NULL_PTR(rsrc_obj)) {
-        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
+        ESP_LOGW(TAG, "failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
         RAISE_ERROR(OUT_OF_MEMORY_ATOM);
     }
 
@@ -440,7 +434,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
 
     if (UNLIKELY(memory_ensure_free(ctx, TERM_BOXED_RESOURCE_SIZE) != MEMORY_GC_OK)) {
         enif_release_resource(rsrc_obj);
-        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        ESP_LOGW(TAG, "failed to allocate memory: %s:%i.", __FILE__, __LINE__);
         RAISE_ERROR(OUT_OF_MEMORY_ATOM);
     }
 
@@ -450,7 +444,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
     // {'$adc', Resource :: resource(), Ref :: reference()} :: adc()
     size_t requested_size = TUPLE_SIZE(3) + REF_SIZE;
     if (UNLIKELY(memory_ensure_free_with_roots(ctx, requested_size, 1, &obj, MEMORY_CAN_SHRINK) != MEMORY_GC_OK)) {
-        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        ESP_LOGW(TAG, "failed to allocate memory: %s:%i.", __FILE__, __LINE__);
         RAISE_ERROR(OUT_OF_MEMORY_ATOM);
     }
 
@@ -464,6 +458,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
     return adc;
 }
 
+// Copied from I2C resource NIF
 static bool is_adc_resource(GlobalContext *global, term t)
 {
     bool ret = term_is_tuple(t)
@@ -475,6 +470,7 @@ static bool is_adc_resource(GlobalContext *global, term t)
     return ret;
 }
 
+// Copied from I2C resource NIF
 static bool to_adc_resource(term adc_resource, struct ADCResource **rsrc_obj, Context *ctx)
 {
     if (!is_adc_resource(ctx->global, adc_resource)) {
@@ -501,7 +497,7 @@ static term nif_adc_take_reading(Context *ctx, int argc, term argv[])
     term adc_resource = argv[0];
     struct ADCResource *rsrc_obj;
     if (UNLIKELY(!to_adc_resource(adc_resource, &rsrc_obj, ctx))) {
-      ESP_LOGE(TAG, "Failed to convert adc_resource");
+      ESP_LOGE(TAG, "failed to convert adc_resource");
       RAISE_ERROR(BADARG_ATOM);
     }
 
@@ -512,7 +508,7 @@ static term nif_adc_take_reading(Context *ctx, int argc, term argv[])
     avm_int_t samples_val = term_to_int(samples);
 
     if (samples_val <= 0) {
-      ESP_LOGE(TAG, "Invalid number of samples");
+      ESP_LOGE(TAG, "invalid number of samples");
       RAISE_ERROR(BADARG_ATOM);
     }
 
@@ -571,7 +567,7 @@ static void nif_adc_resource_dtor(ErlNifEnv *caller_env, void *obj)
 
     esp_err_t err = ESP_OK;
     if (UNLIKELY(err != ESP_OK)) {
-        ESP_LOGW(TAG, "Failed to delete driver in resource d'tor.  err=%i", err);
+        ESP_LOGW(TAG, "failed to delete driver in resource d'tor.  err=%i", err);
     }
 
     ESP_ERROR_CHECK(adc_oneshot_del_unit(rsrc_obj->adc1_handle));
