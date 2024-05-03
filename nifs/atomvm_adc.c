@@ -1,5 +1,7 @@
 //
 // Copyright (c) 2020 dushin.net
+// Copyright (c) 2024 Ricardo Lanziano <arpunk@fatelectron.net>
+// Copyright (c) 2023 Winford <winford@object.stream>
 // All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +18,8 @@
 //
 
 // References
-// https://docs.espressif.com/projects/esp-idf/en/v4.4.4/api-reference/peripherals/adc.html
+// https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32/api-reference/peripherals/adc_oneshot.html
+// https://docs.espressif.com/projects/esp-idf/en/v5.1.2/esp32/api-reference/peripherals/adc_calibration.html
 //
 
 #include "atomvm_adc.h"
@@ -45,6 +48,8 @@
 #define DEFAULT_SAMPLES 64
 #define DEFAULT_VREF 1100
 
+#define AVM_ADC_ATTEN_INVALID 0xFF
+
 static ErlNifResourceType *adc_resource_type;
 
 struct ADCResource
@@ -62,6 +67,9 @@ struct ADCResource
 #ifdef CONFIG_AVM_ADC2_ENABLE
 static const char *const timeout_atom = ATOM_STR("\x7", "timeout");
 #endif
+
+static const char *const invalid_adc_read_atom = ATOM_STR("\xc", "invalid_read");
+static const char *const calibration_error_atom = ATOM_STR("\x11", "calibration_error");
 
 //ADC1 Channels
 #if CONFIG_IDF_TARGET_ESP32
@@ -108,8 +116,10 @@ static const AtomStringIntPair attenuation_table[] = {
     { ATOM_STR("\x6", "db_2_5"), ADC_ATTEN_DB_2_5 },
     { ATOM_STR("\x4", "db_6"), ADC_ATTEN_DB_6 },
     { ATOM_STR("\x5", "db_11"), ADC_ATTEN_DB_11 },
+#ifdef ADC_ATTEN_DB_12
     { ATOM_STR("\x5", "db_12"), ADC_ATTEN_DB_12 },
-    SELECT_INT_DEFAULT(ADC_ATTEN_DB_12)
+#endif
+    SELECT_INT_DEFAULT(AVM_ADC_ATTEN_INVALID)
 };
 
 static adc_unit_t adc_unit_from_pin(int pin_val)
@@ -361,7 +371,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
 
     term pin = interop_kv_get_value(opts, ATOM_STR("\x3", "pin"), global);
     term width = interop_kv_get_value(opts, ATOM_STR("\x8", "bitwidth"), global);
-    term attenuation = interop_kv_get_value(opts, ATOM_STR("\x5", "atten"), global);
+    term attenuation = interop_kv_get_value(opts, ATOM_STR("\xb", "attenuation"), global);
 
     VALIDATE_VALUE(pin, term_is_integer);
     VALIDATE_VALUE(attenuation, term_is_atom);
@@ -485,6 +495,10 @@ static term nif_adc_take_reading(Context *ctx, int argc, term argv[])
 
     term adc_resource = argv[0];
     struct ADCResource *rsrc_obj;
+    if (UNLIKELY(!to_adc_resource(adc_resource, &rsrc_obj, ctx))) {
+      ESP_LOGE(TAG, "Failed to convert adc_resource");
+      RAISE_ERROR(BADARG_ATOM);
+    }
 
     term read_options = argv[1];
     VALIDATE_VALUE(read_options, term_is_list);
@@ -492,35 +506,57 @@ static term nif_adc_take_reading(Context *ctx, int argc, term argv[])
 
     avm_int_t samples_val = term_to_int(samples);
 
-    if (UNLIKELY(!to_adc_resource(adc_resource, &rsrc_obj, ctx))) {
-        ESP_LOGE(TAG, "Failed to convert adc_resource");
-        RAISE_ERROR(BADARG_ATOM);
+    if (samples_val <= 0) {
+      ESP_LOGE(TAG, "Invalid number of samples");
+      RAISE_ERROR(BADARG_ATOM);
     }
 
-    static uint32_t v = 0, r = 0;
-    static int adc_raw, voltage;
+    term raw = interop_kv_get_value_default(read_options, ATOM_STR("\x3", "raw"), FALSE_ATOM, global);
+    term voltage_option = interop_kv_get_value_default(read_options, ATOM_STR("\x7", "voltage"), FALSE_ATOM, global);
+
+    uint32_t v = 0, r = 0;
+    int adc_raw = 0, voltage;
 
     for (avm_int_t i = 0; i < samples_val; ++i) {
-      ESP_ERROR_CHECK(adc_oneshot_read(rsrc_obj->adc1_handle, rsrc_obj->channel, &adc_raw));
-      if (rsrc_obj->cal_1_chan_0) {
-	ESP_ERROR_CHECK(adc_cali_raw_to_voltage(rsrc_obj->adc1_cali_chan0_handle, adc_raw, &voltage));
+      if (ESP_OK != adc_oneshot_read(rsrc_obj->adc1_handle, rsrc_obj->channel, &adc_raw)) {
+	ESP_LOGE(TAG, "ADC1 read error");
+	RAISE_ERROR(invalid_adc_read_atom);
       }
 
+      r += adc_raw;
+
+      if (voltage_option == TRUE_ATOM && rsrc_obj->cal_1_chan_0) {
+	if (ESP_OK != adc_cali_raw_to_voltage(rsrc_obj->adc1_cali_chan0_handle, adc_raw, &voltage)) {
+	  ESP_LOGE(TAG, "ADC1 calibration conversion error");
+	  RAISE_ERROR(calibration_error_atom);
+	}
+
+	v += voltage;
+      }
 #if ATOMVM_USE_ADC2
-      ESP_ERROR_CHECK(adc_oneshot_read(rsrc_obj->adc2_handle, rsrc_obj->channel, &adc_raw));
-      if (rsrc_obj->cal_2) {
-	ESP_ERROR_CHECK(adc_cali_raw_to_voltage(rsrc_obj->adc2_cali_handle, adc_raw, &voltage));
+      if (ESP_OK != adc_oneshot_read(rsrc_obj->adc2_handle, rsrc_obj->channel, &adc_raw)) {
+	ESP_LOGE(TAG, "ADC2 read error");
+	RAISE_ERROR(invalid_adc_read_atom);
+      }
+      if (voltage_option == TRUE_ATOM && rsrc_obj->cal_2) {
+	if (ESP_OK != adc_cali_raw_to_voltage(rsrc_obj->adc2_cali_handle, adc_raw, &voltage)) {
+	  ESP_LOGE(TAG, "ADC2 calibration conversion error");
+	  RAISE_ERROR(calibration_error_atom);
+	}
+
+	v += voltage;
       }
 #endif  //#if ATOMVM_USE_ADC2
-
-      v += voltage;
-      r += adc_raw;
     }
 
-    v /= samples_val;
-    r /= samples_val;
+    term final_raw = raw == TRUE_ATOM ? term_from_int32(r / samples_val) : UNDEFINED_ATOM;
+    term final_voltage = voltage_option == TRUE_ATOM ? term_from_int32(v / samples_val) : UNDEFINED_ATOM;
 
-    return create_triple(ctx, OK_ATOM, term_from_int32(r), term_from_int32(v));
+    if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(3)) != MEMORY_GC_OK)) {
+      RAISE_ERROR(OUT_OF_MEMORY_ATOM);
+    } else {
+      return create_triple(ctx, OK_ATOM, final_raw, final_voltage);
+    }
 }
 
 static void nif_adc_resource_dtor(ErlNifEnv *caller_env, void *obj)
