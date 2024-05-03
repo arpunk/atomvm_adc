@@ -362,6 +362,30 @@ static term create_triple(Context *ctx, term term1, term term2, term term3)
     return ret;
 }
 
+static bool init_adc_channel(adc_oneshot_unit_handle_t *handle,
+			     adc_channel_t channel,
+                             adc_bitwidth_t bit_width,
+			     adc_atten_t atten)
+{
+  adc_cali_handle_t adc_cali_chan_handle = NULL;
+
+  adc_oneshot_unit_init_cfg_t init_config = {
+    .unit_id = channel,  // TODO: might be an error?
+#if ATOMVM_USE_ADC2
+    .ulp_mode = ADC_ULP_MODE_DISABLE,
+#endif  //#if ATOMVM_USE_ADC2
+  };
+
+  ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, handle));
+
+  adc_oneshot_chan_cfg_t config = {
+    .bitwidth = bit_width,
+    .atten = atten,
+  };
+
+  return ESP_OK == adc_oneshot_config_channel(*handle, channel, &config);
+}
+
 static term nif_adc_open(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
@@ -389,19 +413,13 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
     rsrc_obj->transmitting_pid = term_invalid_term();
     rsrc_obj->channel = channel;
 
-    // ADC1 init
+    // ADC1 init and config
     adc_oneshot_unit_handle_t adc1_handle;
-    adc_oneshot_unit_init_cfg_t init_config1 = {
-        .unit_id = channel,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
-
-    // ADC1 config
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = bit_width,
-        .atten = atten,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, channel, &config));
+    if (!init_adc_channel(&adc1_handle, channel, bit_width, atten)) {
+      enif_release_resource(rsrc_obj);
+      ESP_LOGE(TAG, "ADC1 initialization failed");
+      RAISE_ERROR(ERROR_ATOM);
+    }
 
     // ADC1 calibration init
     adc_cali_handle_t adc1_cali_chan0_handle = NULL;
@@ -412,20 +430,17 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
     rsrc_obj->cal_1_chan_0 = do_cal1_chan0;
 
 #if ATOMVM_USE_ADC2
-    // ADC2 init
+    // ADC2 init and config
     adc_oneshot_unit_handle_t adc2_handle;
-    adc_oneshot_unit_init_cfg_t init_config2 = {
-        .unit_id = channel,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config2, &adc2_handle));
+    if (!init_adc_channel(&adc2_handle, channel, bit_width, atten)) {
+      enif_release_resource(rsrc_obj);
+      ESP_LOGE(TAG, "ADC2 initialization failed");
+      RAISE_ERROR(ERROR_ATOM);
+    }
 
     // ADC2 calibration init
     adc_cali_handle_t adc2_cali_handle = NULL;
     bool do_cal2 = nif_adc_calibration_init(ADC_UNIT_2, channel, bit_width, atten, &adc2_cali_handle);
-
-    // ADC2 config
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, channel, &config));
 
     rsrc_obj->adc2_cali_handler = adc2_cali_handler;
     rsrc_obj->adc2_handle = adc2_handle;
