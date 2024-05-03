@@ -292,7 +292,11 @@ static adc_channel_t get_channel(avm_int_t pin_val)
     }
 }
 
-static bool nif_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
+static bool nif_adc_calibration_init(adc_unit_t unit,
+				     adc_channel_t channel,
+				     adc_bitwidth_t bit_width,
+				     adc_atten_t atten,
+				     adc_cali_handle_t *out_handle)
 {
     adc_cali_handle_t handle = NULL;
     esp_err_t ret = ESP_FAIL;
@@ -305,11 +309,11 @@ static bool nif_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc
             .unit_id = unit,
             .chan = channel,
             .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .bitwidth = bit_width,
         };
         ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
-        if (ret == ESP_OK) {
-            calibrated = true;
+	if (ret == ESP_OK) {
+	  calibrated = true;
         }
     }
 #endif
@@ -320,11 +324,11 @@ static bool nif_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc
         adc_cali_line_fitting_config_t cali_config = {
             .unit_id = unit,
             .atten = atten,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .bitwidth = bit_width,
         };
         ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
-        if (ret == ESP_OK) {
-            calibrated = true;
+	if (ret == ESP_OK) {
+	  calibrated = true;
         }
     }
 #endif
@@ -332,6 +336,7 @@ static bool nif_adc_calibration_init(adc_unit_t unit, adc_channel_t channel, adc
     *out_handle = handle;
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Calibration Success");
+	TRACE("Attenuation on channel %u set to %u, bit width %u\n", channel, atten, bit_width);
     } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
         ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
     } else {
@@ -406,7 +411,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
 
     // ADC1 calibration init
     adc_cali_handle_t adc1_cali_chan0_handle = NULL;
-    bool do_cal1_chan0 = nif_adc_calibration_init(ADC_UNIT_1, channel, atten, &adc1_cali_chan0_handle);
+    bool do_cal1_chan0 = nif_adc_calibration_init(ADC_UNIT_1, channel, bit_width, atten, &adc1_cali_chan0_handle);
 
     rsrc_obj->adc1_handle = adc1_handle;
     rsrc_obj->adc1_cali_chan0_handle = adc1_cali_chan0_handle;
@@ -423,7 +428,7 @@ static term nif_adc_open(Context *ctx, int argc, term argv[])
 
     // ADC2 calibration init
     adc_cali_handle_t adc2_cali_handle = NULL;
-    bool do_cal2 = nif_adc_calibration_init(ADC_UNIT_2, channel, atten, &adc2_cali_handle);
+    bool do_cal2 = nif_adc_calibration_init(ADC_UNIT_2, channel, bit_width, atten, &adc2_cali_handle);
 
     // ADC2 config
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, channel, &config));
